@@ -8,6 +8,7 @@ import os
 import argparse
 import time
 import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 from models import FastDVDnet
@@ -19,10 +20,14 @@ NUM_IN_FR_EXT = 5 # temporal size of patch
 MC_ALGO = 'DeepFlow' # motion estimation algorithm
 OUTIMGEXT = '.png' # output images format
 
+def reclaim(frames):
+	""" Call del to help GPU reclaim resources earlier """
+	del frames
+
 def save_out_seq(seqnoisy, seqclean, save_dir, sigmaval, suffix, save_noisy):
 	"""Saves the denoised and noisy sequences under save_dir
 	"""
-	seq_len = seqnoisy.size()[0]
+	seq_len = seqclean.size()[0]
 	for idx in range(seq_len):
 		# Build Outname
 		fext = OUTIMGEXT
@@ -43,7 +48,7 @@ def save_out_seq(seqnoisy, seqclean, save_dir, sigmaval, suffix, save_noisy):
 		outimg = variable_to_cv2_image(seqclean[idx].unsqueeze(dim=0))
 		cv2.imwrite(out_name, outimg)
 
-def test_fastdvdnet(**args):
+def test_fastdvdnet(chunksize:int, **args):
 	"""Denoises all sequences present in a given folder. Sequences must be stored as numbered
 	image sequences. The different sequences must be stored in subfolders under the "test_path" folder.
 
@@ -92,40 +97,56 @@ def test_fastdvdnet(**args):
 
 	with torch.no_grad():
 		# process data
-		seq, _, _ = open_sequence(args['test_path'],\
+		fullseq, expanded_h, expanded_w = open_sequence(args['test_path'],\
 									args['gray'],\
 									expand_if_needed=False,\
 									max_num_fr=args['max_num_fr_per_seq'])
-		seq = torch.from_numpy(seq).to(device)
-		seq_time = time.time()
+		seq_shape = fullseq.shape
+		seqlen = seq_shape[0]
+		print(f"{type(fullseq)} {seq_shape=}, {seqlen=}")
+		denframes = np.ndarray(shape=seq_shape)
 
-		# Add noise
-		noise = torch.empty_like(seq).normal_(mean=0, std=args['noise_sigma']).to(device)
-		seqn = seq + noise
-		noisestd = torch.FloatTensor([args['noise_sigma']]).to(device)
+		for chunk in range(0, seqlen, chunksize):
+			chunkend = min(chunk+chunksize, seqlen)
+			print(f"chunk [{chunk}:{chunkend}]")
+			ourseq = fullseq[chunk:chunkend,:,:,:]
+			seq = torch.from_numpy(ourseq).to(device)
+			seq_time = time.time()
 
-		denframes = denoise_seq_fastdvdnet(seq=seqn,\
-										noise_std=noisestd,\
-										temp_psz=NUM_IN_FR_EXT,\
-										model_temporal=model_temp)
+			# Add noise
+			noise = torch.empty_like(seq).normal_(mean=0, std=args['noise_sigma']).to(device)
+			seqn = seq + noise
+			noisestd = torch.FloatTensor([args['noise_sigma']]).to(device)
+
+			outframes = denoise_seq_fastdvdnet(seq=seqn,\
+											noise_std=noisestd,\
+											temp_psz=NUM_IN_FR_EXT,\
+											model_temporal=model_temp)
+			denframes[chunk:chunkend] = outframes.cpu()
+			reclaim(outframes)
+
+	#the rest of the code still expects denoised frames to be torch.Tensor	
+	print(f"{denframes.shape=}")
+	denframes = torch.from_numpy(denframes)			
 
 	# Compute PSNR and log it
 	stop_time = time.time()
-	psnr = batch_psnr(denframes, seq, 1.)
-	psnr_noisy = batch_psnr(seqn.squeeze(), seq, 1.)
+	#psnr = batch_psnr(denframes, fullseq, 1.)		#TODO: fixed this to work with cpu tensors
+	#psnr_noisy = batch_psnr(seqn.squeeze(), seq, 1.)
 	loadtime = (seq_time - start_time)
 	runtime = (stop_time - seq_time)
 	seq_length = seq.size()[0]
 	logger.info("Finished denoising {}".format(args['test_path']))
 	logger.info("\tDenoised {} frames in {:.3f}s, loaded seq in {:.3f}s".\
 				 format(seq_length, runtime, loadtime))
-	logger.info("\tPSNR noisy {:.4f}dB, PSNR result {:.4f}dB".format(psnr_noisy, psnr))
+	#logger.info("\tPSNR noisy {:.4f}dB, PSNR result {:.4f}dB".format(psnr_noisy, psnr))
 
 	# Save outputs
 	if not args['dont_save_results']:
 		# Save sequence
-		save_out_seq(seqn, denframes, args['save_path'], \
-					   int(args['noise_sigma']*255), args['suffix'], args['save_noisy'])
+		save_out_seq(seqn, denframes, args['save_path'],
+					 int(args['noise_sigma']*255), args['suffix'], args['save_noisy'],
+		)
 
 	# close logger
 	close_logger(logger)
@@ -163,4 +184,4 @@ if __name__ == "__main__":
 		print('\t{}: {}'.format(p, v))
 	print('\n')
 
-	test_fastdvdnet(**vars(argspar))
+	test_fastdvdnet(chunksize=1000, **vars(argspar))

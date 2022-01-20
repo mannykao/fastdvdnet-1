@@ -1,0 +1,9 @@
+future==0.18.2
+opencv-python
+mkl==2021.1.1
+pycodestyle==2.5.0
+pytest==5.4.1
+scikit-image==0.16.2
+torchvision==0.2.1
+tensorboardx==2.0
+
